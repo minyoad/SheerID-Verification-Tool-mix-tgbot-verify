@@ -204,7 +204,11 @@ class GeminiStudentVerifier:
                         f"{config.SHEERID_BASE_URL}/verify/{config.PROGRAM_ID}/?verificationId={self.verification_id}"
                     )
                     if not captcha_token:
-                        logger.warning("未获取到 Turnstile token，继续尝试提交")
+                        raise Exception(
+                            "无法获取 Turnstile 人机验证 token（SheerID 要求 captchaToken 字段）。"
+                            "请检查网络/代理，或配置 CAPSOLVER_API_KEY / 2CAPTCHA_API_KEY 打码服务兜底，"
+                            "或设置 CAPTCHA_HEADLESS=false + xvfb 提高成功率"
+                        )
 
                     body = {
                         "firstName": first_name,
