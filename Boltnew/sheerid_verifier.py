@@ -148,6 +148,15 @@ class SheerIDVerifier:
 
             # 提交教师信息
             logger.info("步骤 2/5: 提交教师信息...")
+
+            # 获取 Turnstile 人机验证 token（SheerID 要求）
+            from utils.captcha_solver import get_turnstile_token
+            captcha_token = get_turnstile_token(
+                f"{config.SHEERID_BASE_URL}/verify/{config.PROGRAM_ID}/?verificationId={self.verification_id}"
+            )
+            if not captcha_token:
+                logger.warning("未获取到 Turnstile token，继续尝试提交")
+
             step2_body = {
                 "firstName": first_name,
                 "lastName": last_name,
@@ -162,6 +171,7 @@ class SheerIDVerifier:
                 "deviceFingerprintHash": self.device_fingerprint,
                 "externalUserId": self.external_user_id,
                 "locale": "en-US",
+                "captchaToken": captcha_token,
                 "metadata": {
                     "marketConsentValue": True,
                     "refererUrl": self.install_page_url,

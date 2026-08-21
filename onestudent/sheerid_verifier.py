@@ -196,7 +196,16 @@ class GeminiStudentVerifier:
                 # Step 2: Submit student info (if needed)
                 if current_step == "collectStudentPersonalInfo":
                     logger.info("Step 2/5: Submitting student info...")
-                    
+
+                    # 获取 Turnstile 人机验证 token（SheerID 要求）
+                    from utils.captcha_solver import get_turnstile_token
+                    captcha_token = await asyncio.to_thread(
+                        get_turnstile_token,
+                        f"{config.SHEERID_BASE_URL}/verify/{config.PROGRAM_ID}/?verificationId={self.verification_id}"
+                    )
+                    if not captcha_token:
+                        logger.warning("未获取到 Turnstile token，继续尝试提交")
+
                     body = {
                         "firstName": first_name,
                         "lastName": last_name,
@@ -210,6 +219,7 @@ class GeminiStudentVerifier:
                         },
                         "deviceFingerprintHash": self.fingerprint,
                         "locale": "en-US",
+                        "captchaToken": captcha_token,
                         "metadata": {
                             "marketConsentValue": False,
                             "verificationId": self.verification_id,
