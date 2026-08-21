@@ -193,7 +193,17 @@ def _solve_with_playwright(verification_url: str, timeout: int) -> Tuple[str, st
                 url = req.url
                 if "challenges.cloudflare.com" not in url:
                     return
+                # 1) 查询参数形式：?sitekey=xxx 或 ?render=xxx
                 m = re.search(r"[?&](?:sitekey|render)=([A-Za-z0-9_-]{20,})", url)
+                if m and m.group(1) not in sitekey_from_requests:
+                    sitekey_from_requests.append(m.group(1))
+                # 2) 路径片段形式：/h/b/turnstile/f/av0/rch/kot4a/<sitekey>/auto/...
+                #    （challenge-platform 的 URL 中 sitekey 常以路径段出现，如
+                #     0x4AAAAAACaWNlR_tN9-HfHj，且 Turnstile sitekey 均以 0x4 开头）
+                m = re.search(
+                    r"/turnstile/[^/]+/[^/]+/[^/]+/[^/]+/(0x[0-9A-Za-z_-]{20,})/",
+                    url,
+                )
                 if m and m.group(1) not in sitekey_from_requests:
                     sitekey_from_requests.append(m.group(1))
 
@@ -237,6 +247,11 @@ def _solve_with_playwright(verification_url: str, timeout: int) -> Tuple[str, st
                 time.sleep(2)
 
             if not token:
+                # 轮询结束仍未拿到 token：此时 challenge 相关请求应已全部发出，
+                # 若此前 sitekey 未提取到，再尝试从网络请求 URL 补充
+                if not sitekey and sitekey_from_requests:
+                    sitekey = sitekey_from_requests[0]
+                    logger.info(f"已从网络请求 URL 提取到 sitekey（轮询后补取）: {sitekey[:8]}...")
                 logger.warning(
                     "Playwright 在限定时间内未获取到 Turnstile token"
                     "（headless 模式可能被 Cloudflare 判定为机器人；"
@@ -466,11 +481,9 @@ def _solve_with_third_party(
 
     logger.warning(
         "未检测到第三方打码服务 key（2CAPTCHA_API_KEY / CAPSOLVER_API_KEY 均为空）。"
-        "请确认：① 已创建项目根目录 .env 并填入 key；"
-        "② Docker 部署时 docker-compose 已转发该变量到容器"
-        "（注意 2CAPTCHA_API_KEY 以数字开头，Compose 的 .env 解析不支持，"
-        "需用 export 或 systemd Environment= 传入）；"
-        "③ 重启 bot 进程使配置生效"
+        "请确认已把 key 写入配置文件并重启进程："
+        "Docker 部署 → /docker/sheerid/data/.env（挂载为 /app/data/.env）；"
+        "本机运行 → 项目根目录 .env（可直接写 2CAPTCHA_API_KEY，无数字开头限制）"
     )
     return ""
 
