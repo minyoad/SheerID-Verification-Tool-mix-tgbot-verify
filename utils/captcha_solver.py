@@ -21,6 +21,7 @@ SheerID 在学生/教师信息提交步骤启用了 Cloudflare Turnstile 人机�
     from utils.captcha_solver import get_turnstile_token
     token = get_turnstile_token("https://services.sheerid.com/verify/xxx/?verificationId=yyy")
 """
+import hashlib
 import logging
 import os
 import re
@@ -108,24 +109,44 @@ _SITEKEY_IFRAME_RE = re.compile(r'[?&]sitekey=([A-Za-z0-9_-]{20,})')
 
 
 def get_turnstile_token(verification_url: str, timeout: int = _DEFAULT_TIMEOUT) -> str:
-    """入口：按优先级尝试多种策略获取 Turnstile token
+    """入口：按优先级尝试多种策略获取 Turnstile token（兼容旧调用）"""
+    token, _ = get_turnstile_token_with_context(verification_url, timeout)
+    return token
+
+
+def get_turnstile_token_with_context(
+    verification_url: str, timeout: int = _DEFAULT_TIMEOUT
+) -> Tuple[str, str]:
+    """获取 Turnstile token + 与 token 同环境的真实浏览器指纹
 
     Args:
         verification_url: SheerID 验证页面 URL（含 verificationId）
         timeout: 最大等待秒数（Playwright 阶段）
 
     Returns:
-        str: Turnstile token，全部失败返回空字符串
+        (token, fingerprint):
+        - token: Turnstile token（Playwright 自动完成优先，第三方打码兜底）
+        - fingerprint: 在 Playwright 页面内收集的真实浏览器指纹 md5
+          （与 token 同环境，用于提交时的 deviceFingerprintHash，降低风控差异）；
+          页面未打开或提取失败时为空字符串
     """
     sitekey = _fetch_sitekey_via_requests(verification_url)
+    # 快速预检：requests 抓到的 HTML 若已是 SheerID 错误页（验证会话被拒/失效），
+    # 直接失败返回，避免再启动 Playwright 空等
+    if _is_rejected_page(_last_fetched_html):
+        logger.error(
+            "页面提示无法继续验证（We couldn't continue your verification）："
+            "该 verificationId 已被 SheerID 拒绝或链接已失效，请更换新的验证链接"
+        )
+        return "", ""
     action, cdata = _extract_turnstile_meta_from_html(_last_fetched_html)
 
-    token, dom_sitekey, dom_action, dom_cdata = _solve_with_playwright(
+    token, dom_sitekey, dom_action, dom_cdata, fingerprint = _solve_with_playwright(
         verification_url, timeout
     )
     if token:
         logger.info("✓ Turnstile token 获取成功（Playwright 自动完成）")
-        return token
+        return token, fingerprint
 
     if dom_sitekey and not sitekey:
         sitekey = dom_sitekey
@@ -135,18 +156,21 @@ def get_turnstile_token(verification_url: str, timeout: int = _DEFAULT_TIMEOUT) 
     token = _solve_with_third_party(verification_url, sitekey, action, cdata)
     if token:
         logger.info("✓ Turnstile token 获取成功（第三方打码服务）")
-    return token
+    return token, fingerprint
 
 
 # ---------------------------------------------------------------------------
 # 策略 1：Playwright 反检测浏览器
 # ---------------------------------------------------------------------------
-def _solve_with_playwright(verification_url: str, timeout: int) -> Tuple[str, str, str, str]:
-    """通过 Playwright 打开验证页面自动完成验证；返回 (token, sitekey, action, cdata)"""
+def _solve_with_playwright(
+    verification_url: str, timeout: int
+) -> Tuple[str, str, str, str, str]:
+    """通过 Playwright 打开验证页面自动完成验证；返回 (token, sitekey, action, cdata, fingerprint)"""
     token = ""
     sitekey = ""
     action = ""
     cdata = ""
+    fingerprint = ""
     browser = None
     headless = os.getenv("CAPTCHA_HEADLESS", "true").strip().lower() != "false"
     force_headed = os.getenv("CAPTCHA_FORCE_HEADED", "").strip().lower() == "true"
@@ -191,7 +215,10 @@ def _solve_with_playwright(verification_url: str, timeout: int) -> Tuple[str, st
 
             def _on_request(req):
                 url = req.url
-                if "challenges.cloudflare.com" not in url:
+                # 放宽过滤：只要 URL 与 cloudflare/turnstile 相关即检查
+                # （challenges.cloudflare.com 是 turnstile 脚本/iframe 主域；
+                #  放宽后可覆盖更多变体域名，避免漏抓）
+                if "cloudflare" not in url and "turnstile" not in url:
                     return
                 # 1) 查询参数形式：?sitekey=xxx 或 ?render=xxx
                 m = re.search(r"[?&](?:sitekey|render)=([A-Za-z0-9_-]{20,})", url)
@@ -206,17 +233,51 @@ def _solve_with_playwright(verification_url: str, timeout: int) -> Tuple[str, st
                 )
                 if m and m.group(1) not in sitekey_from_requests:
                     sitekey_from_requests.append(m.group(1))
+                # 3) 最宽松兜底：URL 任意位置出现 0x4 开头的 sitekey
+                m = re.search(r"(0x4[0-9A-Za-z_-]{20,})", url)
+                if m and m.group(1) not in sitekey_from_requests:
+                    sitekey_from_requests.append(m.group(1))
 
             page.on("request", _on_request)
 
             logger.info(f"打开验证页面: {verification_url}")
             page.goto(verification_url, wait_until="domcontentloaded", timeout=30000)
 
-            # 等待 turnstile 脚本加载完成
-            _wait_turnstile_loaded(page)
+            # 快速预检：页面正文若显示 SheerID 拒绝/错误文案，说明该验证会话
+            # 已不可继续（verificationId 被拒/失效），直接失败返回，避免空转轮询
+            if _page_shows_rejection(page):
+                logger.error(
+                    "页面显示拒绝/错误文案（We couldn't continue your verification）："
+                    "该验证会话已被 SheerID 拒绝或链接已失效，请更换新的验证链接重试"
+                )
+                return "", "", "", "", ""
 
-            # 提取 sitekey（供第三方兜底使用），并用完整 HTML 兜底
-            sitekey = _extract_sitekey(page)
+            # 等待 turnstile 脚本加载完成；未加载时 reload 重试一次
+            # （页面 JS 渲染慢或首次请求被 Cloudflare 拦截时，window.turnstile
+            #   可能迟迟不出现，硬等下去只会空转轮询，重载一次成功率更高）
+            if not _wait_turnstile_loaded(page, wait_secs=20):
+                logger.warning(
+                    "window.turnstile 未在限定时间内加载（页面 JS 渲染慢或首次请求被拦），"
+                    "重新加载页面重试一次..."
+                )
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=30000)
+                except Exception:
+                    pass
+                _wait_turnstile_loaded(page, wait_secs=25)
+
+            # 收集与 token 同环境的真实浏览器指纹（供提交时的 deviceFingerprintHash
+            # 使用；与 token 同一浏览器环境生成，降低 SheerID 风控差异）
+            fingerprint = _collect_browser_fingerprint(page)
+
+            # 提取 sitekey / action / cdata（供第三方兜底使用）
+            # 1) widget 内部配置（最可靠，SPA 页面也能拿到 action/cdata）
+            w_sk, w_action, w_cdata = _extract_turnstile_widget_config(page)
+            sitekey = _extract_sitekey(page) or w_sk
+            if w_action:
+                action = w_action
+            if w_cdata:
+                cdata = w_cdata
             if not sitekey and sitekey_from_requests:
                 sitekey = sitekey_from_requests[0]
                 logger.info(f"已从网络请求 URL 提取到 sitekey: {sitekey[:8]}...")
@@ -229,21 +290,41 @@ def _solve_with_playwright(verification_url: str, timeout: int) -> Tuple[str, st
                     m = re.search(r'["\']sitekey["\']\s*:\s*["\']([A-Za-z0-9_-]{20,})["\']', html)
                     if m:
                         sitekey = m.group(1)
-                action, cdata = _extract_turnstile_meta_from_html(html)
+                if not action or not cdata:
+                    h_action, h_cdata = _extract_turnstile_meta_from_html(html)
+                    action = action or h_action
+                    cdata = cdata or h_cdata
             except Exception:
                 pass
             if sitekey:
-                logger.info(f"已提取 Turnstile sitekey: {sitekey[:8]}...（action={action or '-'}）")
+                logger.info(
+                    f"已提取 Turnstile sitekey: {sitekey[:8]}...（action={action or '-'}，"
+                    f"cdata={cdata[:12] + '...' if cdata else '-'}）"
+                )
 
             # 主动触发 turnstile 执行（自动执行模式未生效时）
             _trigger_turnstile(page)
 
-            # 轮询提取 token
+            # 轮询提取 token（期间持续补取 sitekey；turnstile 若在轮询期间
+            # 才加载完成则补触发执行，避免空转到超时）
             start = time.time()
+            trigger_done = False
             while time.time() - start < timeout:
                 token = _poll_token(page)
                 if token:
                     break
+                if not trigger_done:
+                    try:
+                        if page.evaluate("() => !!window.turnstile"):
+                            _trigger_turnstile(page)
+                            trigger_done = True
+                    except Exception:
+                        pass
+                if not sitekey:
+                    sitekey = _extract_sitekey(page)
+                    if not sitekey and sitekey_from_requests:
+                        sitekey = sitekey_from_requests[0]
+                        logger.info(f"已从网络请求 URL 提取到 sitekey: {sitekey[:8]}...")
                 time.sleep(2)
 
             if not token:
@@ -266,10 +347,10 @@ def _solve_with_playwright(verification_url: str, timeout: int) -> Tuple[str, st
             except Exception:
                 pass
 
-    return token, sitekey, action, cdata
+    return token, sitekey, action, cdata, fingerprint
 
 
-def _wait_turnstile_loaded(page, wait_secs: int = 10) -> bool:
+def _wait_turnstile_loaded(page, wait_secs: int = 30) -> bool:
     """等待 window.turnstile 可用"""
     start = time.time()
     while time.time() - start < wait_secs:
@@ -401,6 +482,101 @@ def _extract_sitekey(page) -> str:
         return ""
 
 
+def _extract_turnstile_widget_config(page) -> Tuple[str, str, str]:
+    """从 window.turnstile._c 的 widget 配置中提取 (sitekey, action, cdata)
+
+    这是 SPA 页面最可靠的参数来源：widget 渲染时若带 data-action / data-cdata，
+    其值会进入 turnstile 内部 widget config；2captcha 打码时必须传一致
+    action/data 参数，否则服务端 token 校验失败（invalidCaptchaToken）。
+    """
+    try:
+        result = (
+            page.evaluate(
+                """() => {
+                    const pick = (v) => (typeof v === 'string' && v.trim()) ? v.trim() : '';
+                    if (!window.turnstile) return { sitekey: '', action: '', cdata: '' };
+                    const widgets = window.turnstile._c || [];
+                    for (const item of widgets) {
+                        if (!item) continue;
+                        const cfg = item.config || item;
+                        const out = {
+                            sitekey: pick(cfg.sitekey),
+                            action: pick(cfg.action),
+                            cdata: pick(cfg.cdata),
+                        };
+                        if (out.sitekey || out.action || out.cdata) return out;
+                    }
+                    return { sitekey: '', action: '', cdata: '' };
+                }"""
+            )
+            or {}
+        )
+        return (
+            result.get("sitekey") or "",
+            result.get("action") or "",
+            result.get("cdata") or "",
+        )
+    except Exception:
+        return "", "", ""
+
+
+def _collect_browser_fingerprint(page) -> str:
+    """从当前 Playwright 页面收集真实浏览器特征，生成 md5 指纹
+
+    与 Turnstile token 同一浏览器环境生成，用作提交时的 deviceFingerprintHash，
+    避免「token 环境与指纹/提交环境不一致」触发 SheerID 风控。
+    同一容器内 Chromium 特征稳定，指纹可复现。
+    """
+    try:
+        components = page.evaluate(
+            """() => {
+                const canvasFp = () => {
+                    try {
+                        const c = document.createElement('canvas');
+                        c.width = 220; c.height = 30;
+                        const ctx = c.getContext('2d');
+                        if (!ctx) return '';
+                        ctx.textBaseline = 'top';
+                        ctx.font = "14px 'Arial'";
+                        ctx.fillStyle = '#f60';
+                        ctx.fillRect(125, 1, 62, 20);
+                        ctx.fillStyle = '#069';
+                        ctx.fillText('SheerID-Fingerprint-Test-123', 2, 15);
+                        ctx.fillStyle = 'rgba(102, 204, 0, 0.7)';
+                        ctx.fillText('SheerID-Fingerprint-Test-456', 4, 17);
+                        return c.toDataURL();
+                    } catch (e) { return ''; }
+                };
+                let tz = '';
+                try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) {}
+                let webgl = '';
+                try {
+                    const gl = document.createElement('canvas').getContext('webgl');
+                    if (gl) {
+                        const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+                        webgl = dbg ? (gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '') : '';
+                    }
+                } catch (e) {}
+                return [
+                    navigator.userAgent || '',
+                    screen.width + 'x' + screen.height + 'x' + (screen.colorDepth || 24),
+                    (navigator.language || '') + '|' + ((navigator.languages || []).join(',')),
+                    tz,
+                    String(new Date().getTimezoneOffset()),
+                    String(navigator.hardwareConcurrency || ''),
+                    String(navigator.deviceMemory || ''),
+                    navigator.platform || '',
+                    canvasFp(),
+                    webgl,
+                ];
+            }"""
+        )
+        raw = "|".join(str(c) for c in (components or []))
+        return hashlib.md5(raw.encode()).hexdigest() if raw else ""
+    except Exception:
+        return ""
+
+
 # ---------------------------------------------------------------------------
 # sitekey 提取（requests 直连，供第三方兜底）
 # ---------------------------------------------------------------------------
@@ -445,6 +621,30 @@ def _extract_sitekey_from_html(html: str) -> str:
     return ""
 
 
+# SheerID 拒绝/错误页文案：命中说明该 verificationId 的验证会话已被后端拒绝或失效
+_REJECTION_MARKERS = (
+    "We couldn't continue your verification",
+    "We are unable to verify you at this time",
+    "unable to verify you at this time",
+)
+
+
+def _is_rejected_page(html: str) -> bool:
+    """检查 HTML/文本是否包含 SheerID 拒绝页文案"""
+    if not html:
+        return False
+    return any(marker in html for marker in _REJECTION_MARKERS)
+
+
+def _page_shows_rejection(page) -> bool:
+    """通过 Playwright 读取页面正文，检查是否显示 SheerID 拒绝文案"""
+    try:
+        text = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+        return _is_rejected_page(text)
+    except Exception:
+        return False
+
+
 def _extract_turnstile_meta_from_html(html: str) -> Tuple[str, str]:
     """从页面 HTML 提取 data-action 与 data-cdata（2captcha Turnstile 可选参数）"""
     if not html:
@@ -457,6 +657,15 @@ def _extract_turnstile_meta_from_html(html: str) -> Tuple[str, str]:
     m = re.search(r'data-cdata="([^"]+)"', html)
     if m:
         cdata = m.group(1)
+    # JSON 配置形式："action":"xxx" / "cdata":"xxx"（widget 以 JS 对象渲染时）
+    if not action:
+        m = re.search(r'["\']action["\']\s*:\s*["\']([^"\']+)["\']', html)
+        if m:
+            action = m.group(1)
+    if not cdata:
+        m = re.search(r'["\']cdata["\']\s*:\s*["\']([^"\']+)["\']', html)
+        if m:
+            cdata = m.group(1)
     return action, cdata
 
 
@@ -475,7 +684,7 @@ def _solve_with_third_party(
     twocaptcha_key = os.getenv("2CAPTCHA_API_KEY", "").strip()
 
     if capsolver_key:
-        return _solve_with_capsolver(page_url, sitekey, capsolver_key)
+        return _solve_with_capsolver(page_url, sitekey, capsolver_key, action, cdata)
     if twocaptcha_key:
         return _solve_with_2captcha(page_url, sitekey, twocaptcha_key, action, cdata)
 
@@ -488,7 +697,9 @@ def _solve_with_third_party(
     return ""
 
 
-def _solve_with_capsolver(page_url: str, sitekey: str, api_key: str) -> str:
+def _solve_with_capsolver(
+    page_url: str, sitekey: str, api_key: str, action: str = "", cdata: str = ""
+) -> str:
     """capsolver: AntiTurnstileTaskProxyLess"""
     try:
         import requests
@@ -497,16 +708,27 @@ def _solve_with_capsolver(page_url: str, sitekey: str, api_key: str) -> str:
         return ""
 
     try:
+        task = {
+            "type": "AntiTurnstileTaskProxyLess",
+            "websiteURL": page_url,
+            "websiteKey": sitekey,
+        }
+        # capsolver 支持 metadata.action / metadata.cdata（与 2captcha 的
+        # action/data 对应），widget 带这些参数时须一并传入
+        metadata = {}
+        if action:
+            metadata["action"] = action
+        if cdata:
+            metadata["cdata"] = cdata
+        if metadata:
+            task["metadata"] = metadata
+        logger.info(
+            f"capsolver 打码提交: sitekey={sitekey[:8]}... action={action or '-'} "
+            f"cdata={cdata[:12] + '...' if cdata else '-'}"
+        )
         resp = requests.post(
             "https://api.capsolver.com/createTask",
-            json={
-                "clientKey": api_key,
-                "task": {
-                    "type": "AntiTurnstileTaskProxyLess",
-                    "websiteURL": page_url,
-                    "websiteKey": sitekey,
-                },
-            },
+            json={"clientKey": api_key, "task": task},
             timeout=20,
         )
         data = resp.json()
@@ -558,6 +780,10 @@ def _solve_with_2captcha(
             params["action"] = action
         if cdata:
             params["data"] = cdata
+        logger.info(
+            f"2captcha 打码提交: sitekey={sitekey[:8]}... action={action or '-'} "
+            f"cdata={cdata[:12] + '...' if cdata else '-'}"
+        )
         r = requests.get(
             "https://2captcha.com/in.php",
             params=params,

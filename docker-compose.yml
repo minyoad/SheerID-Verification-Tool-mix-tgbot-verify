@@ -14,8 +14,14 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - PYTHONUNBUFFERED=1
+      # 有头模式（CAPTCHA_HEADLESS=false）所需的虚拟显示；无头模式不受影响
+      - DISPLAY=:99
       # 如需 MySQL：在 /app/data/.env 中设置 DB_TYPE=mysql 及 MYSQL_* 配置，
       # 并取消底部注释的 mysql 服务。
+
+    # 启动 Xvfb 虚拟显示（供 CAPTCHA_HEADLESS=false 有头浏览器使用），再运行 bot。
+    # 无头模式（默认 CAPTCHA_HEADLESS=true）不需要 X 显示，本配置不产生副作用。
+    command: bash -c "Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset & sleep 1; exec python -u bot.py"
 
     # 扩大共享内存（Chromium 渲染必需，避免 /dev/shm 过小导致卡死）
     shm_size: "1gb"

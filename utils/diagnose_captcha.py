@@ -72,6 +72,21 @@ try:
     print(f"    正则提取 sitekey: {mask(sk) if sk else '<未找到>'}")
     if "cloudflare" in r.url.lower():
         print("    ⚠️ 最终 URL 指向 cloudflare（可能被 challenge 拦截）")
+
+    # 单独测试 turnstile 脚本 CDN 连通性（容器内网络是否可达 challenges.cloudflare.com）
+    try:
+        r2 = requests.get(
+            "https://challenges.cloudflare.com/turnstile/v0/api.js",
+            timeout=10,
+            headers={"User-Agent": cs._UA},
+        )
+        print(f"    challenges.cloudflare.com/turnstile/v0/api.js: 状态码 {r2.status_code}, {len(r2.content)} bytes")
+        if r2.status_code == 403:
+            print("    ⚠️ 403：容器出口 IP 可能被 Cloudflare 风控/拦截")
+        elif r2.status_code == 200 and len(r2.content) < 100:
+            print("    ⚠️ 返回内容过小，可能不是正常 JS（疑似被拦）")
+    except Exception as e:
+        print(f"    ⚠️ challenges.cloudflare.com 访问失败（容器网络/DNS 问题）: {e}")
 except Exception as e:
     print(f"    requests 失败: {e}")
 
@@ -82,6 +97,10 @@ try:
     from playwright.sync_api import sync_playwright
 
     cloudflare_urls = []
+    turnstile_status = []  # (url 摘要, 状态码)
+    failed_reqs = []
+    console_msgs = []
+    page_errors = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=cs._LAUNCH_ARGS)
@@ -94,13 +113,39 @@ try:
             if "cloudflare" in u or "turnstile" in u:
                 cloudflare_urls.append(u)
 
+        def on_resp(resp):
+            u = resp.url
+            if "cloudflare" in u or "turnstile" in u:
+                turnstile_status.append((u[:150], resp.status))
+
+        def on_fail(fail):
+            failed_reqs.append(f"{fail.url[:150]} :: {fail.failure}")
+
+        def on_console(msg):
+            if msg.type in ("error", "warning"):
+                console_msgs.append(f"[{msg.type}] {msg.text[:200]}")
+
+        def on_pageerror(err):
+            page_errors.append(str(err)[:300])
+
         page.on("request", on_req)
+        page.on("response", on_resp)
+        page.on("requestfailed", on_fail)
+        page.on("console", on_console)
+        page.on("pageerror", on_pageerror)
         page.goto(URL, wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(20000)
 
+        print(f"    最终 URL: {page.url[:150]}")
+        if "cloudflare" in page.url.lower():
+            print("    ⚠️ 页面被重定向到 cloudflare 域（可能被 challenge 拦截）")
         print(f"    抓到的 cloudflare/turnstile 请求: {len(cloudflare_urls)} 条")
         for u in cloudflare_urls[:15]:
             print(f"      - {u[:160]}")
+        print(f"    相关请求响应状态码: {turnstile_status if turnstile_status else '<无>'}")
+        print(f"    请求失败: {failed_reqs if failed_reqs else '<无>'}")
+        print(f"    页面 JS 报错: {page_errors if page_errors else '<无>'}")
+        print(f"    console 错误/警告: {console_msgs[:8] if console_msgs else '<无>'}")
 
         dom = page.evaluate(
             """() => ({

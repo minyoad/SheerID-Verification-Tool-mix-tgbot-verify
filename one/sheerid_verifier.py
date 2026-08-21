@@ -1,9 +1,12 @@
 """SheerID 学生验证主程序"""
 import re
+import json
+import base64
 import random
 import logging
 import hashlib
 import time
+import uuid
 import httpx
 from typing import Dict, Optional, Tuple
 
@@ -50,8 +53,35 @@ class SheerIDVerifier:
         self.device_fingerprint = generate_realistic_fingerprint()
         # Random Chrome version for realistic User-Agent
         chrome_ver = random.choice(["120.0.6099.109", "121.0.6167.85", "122.0.6261.94", "123.0.6312.58", "124.0.6367.78"])
+        major = chrome_ver.split(".")[0]
         self.user_agent = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_ver} Safari/537.36"
+        # sec-ch-ua 品牌版本需与 User-Agent 主版本一致
+        self._sec_ch_ua = (
+            f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not-A.Brand";v="99"'
+        )
         self.http_client = httpx.Client(timeout=30.0)
+
+    def _newrelic_headers(self) -> Dict[str, str]:
+        """生成 NewRelic 追踪请求头（SheerID 前端 jslib 真实请求会携带）"""
+        trace_id = (uuid.uuid4().hex + uuid.uuid4().hex[:8])[:32]
+        span_id = uuid.uuid4().hex[:16]
+        timestamp = int(time.time() * 1000)
+        payload = {
+            "v": [0, 1],
+            "d": {
+                "ty": "Browser",
+                "ac": "364029",
+                "ap": "134291347",
+                "id": span_id,
+                "tr": trace_id,
+                "ti": timestamp,
+            },
+        }
+        return {
+            "newrelic": base64.b64encode(json.dumps(payload).encode()).decode(),
+            "traceparent": f"00-{trace_id}-{span_id}-01",
+            "tracestate": f"364029@nr=0-1-364029-134291347-{span_id}----{timestamp}",
+        }
 
     def __del__(self):
         if hasattr(self, "http_client"):
@@ -79,8 +109,19 @@ class SheerIDVerifier:
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip, deflate, br",
+            "Cache-Control": "no-cache",
             "Origin": "https://services.sheerid.com",
             "Referer": f"https://services.sheerid.com/verify/{config.PROGRAM_ID}/",
+            # --- 以下为 anti-detection 头（对齐真实浏览器 jslib 请求） ---
+            "sec-ch-ua": self._sec_ch_ua,
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "clientversion": "2.158.0",
+            "clientname": "jslib",
+            **self._newrelic_headers(),
         }
 
         try:
@@ -148,9 +189,9 @@ class SheerIDVerifier:
             # 提交学生信息
             logger.info("步骤 2/4: 提交学生信息...")
 
-            # 获取 Turnstile 人机验证 token（SheerID 要求）
-            from utils.captcha_solver import get_turnstile_token
-            captcha_token = get_turnstile_token(
+            # 获取 Turnstile 人机验证 token（SheerID 要求），并取同环境真实浏览器指纹
+            from utils.captcha_solver import get_turnstile_token_with_context
+            captcha_token, real_fingerprint = get_turnstile_token_with_context(
                 f"{config.SHEERID_BASE_URL}/verify/{config.PROGRAM_ID}/?verificationId={self.verification_id}"
             )
             if not captcha_token:
@@ -159,6 +200,12 @@ class SheerIDVerifier:
                     "请检查网络/代理，或配置 CAPSOLVER_API_KEY / 2CAPTCHA_API_KEY 打码服务兜底，"
                     "或设置 CAPTCHA_HEADLESS=false + xvfb 提高成功率"
                 )
+            # 用与 token 同环境收集的真实浏览器指纹替代随机指纹，降低风控差异
+            if real_fingerprint:
+                self.device_fingerprint = real_fingerprint
+                logger.info(
+                    f"使用真实浏览器指纹（与 token 同环境）: {real_fingerprint[:12]}..."
+                )
 
             step2_body = {
                 "firstName": first_name,
@@ -166,7 +213,6 @@ class SheerIDVerifier:
                 "birthDate": birth_date,
                 "email": email,
                 "phoneNumber": "",
-                "country": "US",
                 "organization": {
                     "id": int(school_id),
                     "idExtended": school["idExtended"],
@@ -177,10 +223,7 @@ class SheerIDVerifier:
                 "captchaToken": captcha_token,
                 "metadata": {
                     "marketConsentValue": False,
-                    "refererUrl": f"{config.SHEERID_BASE_URL}/verify/{config.PROGRAM_ID}/?verificationId={self.verification_id}",
                     "verificationId": self.verification_id,
-                    "flags": '{"collect-info-step-email-first":"default","doc-upload-considerations":"default","doc-upload-may24":"default","doc-upload-redesign-use-legacy-message-keys":false,"docUpload-assertion-checklist":"default","font-size":"default","include-cvec-field-france-student":"not-labeled-optional"}',
-                    "submissionOptIn": "By submitting the personal information above, I acknowledge that my personal information is being collected under the privacy policy of the business from which I am seeking a discount",
                 },
             }
 
@@ -194,6 +237,12 @@ class SheerIDVerifier:
                 raise Exception(f"步骤 2 失败 (状态码 {step2_status}): {step2_data}")
             if step2_data.get("currentStep") == "error":
                 error_msg = ", ".join(step2_data.get("errorIds", ["Unknown error"]))
+                # 打印完整响应，便于定位具体风控规则（fraudRulesReject 时 errorIds
+                # 可能附带结构化详情，如被拒字段、规则 ID 等）
+                logger.error(
+                    "步骤 2 完整响应: %s",
+                    json.dumps(step2_data, ensure_ascii=False)[:2000],
+                )
                 raise Exception(f"步骤 2 错误: {error_msg}")
 
             logger.info(f"✅ 步骤 2 完成: {step2_data.get('currentStep')}")

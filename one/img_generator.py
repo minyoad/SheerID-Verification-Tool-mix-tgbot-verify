@@ -818,8 +818,15 @@ def generate_psu_id():
 
 
 def generate_psu_email(first_name, last_name):
-    """Deprecated: Use generate_university_email() instead"""
-    return generate_university_email(first_name, last_name, 'mit')
+    """Generate a Penn State student email (Access Account format: abc1234@psu.edu)
+
+    PSU 学生邮箱为 Access Account 格式：3 个字母 + 4 位数字 @psu.edu。
+    注意必须与提交的学校（Pennsylvania State University）域名匹配，
+    否则 SheerID 风控会返回 fraudRulesReject。
+    """
+    letters = ''.join(random.choice('abcdefghijklmnopqrstuvwxyz') for _ in range(3))
+    digits = ''.join(random.choice('0123456789') for _ in range(4))
+    return f"{letters}{digits}@psu.edu"
 
 
 if __name__ == '__main__':
