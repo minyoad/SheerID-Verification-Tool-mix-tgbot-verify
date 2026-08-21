@@ -5,37 +5,24 @@ services:
     restart: unless-stopped
 
     # 环境变量
+    # 机器人配置（BOT_TOKEN、DB_*、CAPTCHA_*、2CAPTCHA_API_KEY 等）不再通过
+    # compose 插值转发，而是由代码直接读取挂载卷 /app/data/.env
+    # （宿主机对应 ${DATA_DIR:-/docker/sheerid}/data/.env，见下方 volumes）。
+    # 修改配置只需编辑宿主机该文件后重启容器；2CAPTCHA_API_KEY 等数字开头
+    # 变量名也可直接写入文件，无 compose 插值限制。
+    # 此处仅保留容器运行所需参数。
     environment:
       - TZ=Asia/Shanghai
       - PYTHONUNBUFFERED=1
-      # Telegram Bot 配置
-      - BOT_TOKEN=${BOT_TOKEN}
-      - CHANNEL_USERNAME=${CHANNEL_USERNAME:-pk_oa}
-      - CHANNEL_URL=${CHANNEL_URL:-https://t.me/pk_oa}
-      - ADMIN_USER_ID=${ADMIN_USER_ID}
-      # 数据库配置（默认 SQLite，无需额外服务）
-      - DB_TYPE=${DB_TYPE:-sqlite}
-      - SQLITE_PATH=${SQLITE_PATH:-/app/data/bot.db}
-      # Turnstile 验证码配置（Playwright 参数 + 第三方打码服务兜底）
-      # 注意：2CAPTCHA_API_KEY 以数字开头，Compose 的 .env 解析不支持，需通过
-      # shell export 或 systemd Environment= 传入；CAPSOLVER_API_KEY 无此限制。
-      - CAPTCHA_HEADLESS=${CAPTCHA_HEADLESS:-true}
-      - CAPTCHA_FORCE_HEADED=${CAPTCHA_FORCE_HEADED:-false}
-      - 2CAPTCHA_API_KEY=${2CAPTCHA_API_KEY:-}
-      - CAPSOLVER_API_KEY=${CAPSOLVER_API_KEY:-}
-      # 如需 MySQL，将 DB_TYPE 设为 mysql 并取消下方注释（同时启用底部 mysql 服务）
-      # - MYSQL_HOST=${MYSQL_HOST:-mysql}
-      # - MYSQL_PORT=${MYSQL_PORT:-3306}
-      # - MYSQL_USER=${MYSQL_USER:-tgbot_user}
-      # - MYSQL_PASSWORD=${MYSQL_PASSWORD}
-      # - MYSQL_DATABASE=${MYSQL_DATABASE:-tgbot_verify}
+      # 如需 MySQL：在 /app/data/.env 中设置 DB_TYPE=mysql 及 MYSQL_* 配置，
+      # 并取消底部注释的 mysql 服务。
 
     # 扩大共享内存（Chromium 渲染必需，避免 /dev/shm 过小导致卡死）
     shm_size: "1gb"
 
     # 数据持久化（统一挂载到 /docker/sheerid）
     volumes:
-      # SQLite 数据库文件（DB_TYPE=sqlite 时使用）
+      # SQLite 数据库文件（DB_TYPE=sqlite 时使用）及 .env 配置（挂载进 /app/data/.env）
       - ${DATA_DIR:-/docker/sheerid}/data:/app/data
       # 日志
       - ${DATA_DIR:-/docker/sheerid}/logs:/app/logs
@@ -52,10 +39,9 @@ services:
 
 # ==================== 可选：MySQL 模式 ====================
 # 如需使用 MySQL 替代 SQLite：
-#   1. 在 .env 中将 DB_TYPE 设为 mysql
-#   2. 取消下方 mysql 服务注释
-#   3. 取消 tgbot 服务中 MYSQL_* 环境变量的注释
-#   4. 首次部署需创建目录并授权：
+#   1. 在数据目录 .env（/docker/sheerid/data/.env）中设置 DB_TYPE=mysql 及 MYSQL_* 配置
+#   2. 取消下方 mysql 服务注释（该服务通过 env_file 直接读取同一份 .env，不经插值解析）
+#   3. 首次部署需创建目录并授权：
 #      mkdir -p /docker/sheerid/mysql_data && chown -R 999:999 /docker/sheerid/mysql_data
 #
 # mysql:
@@ -64,10 +50,8 @@ services:
 #   restart: unless-stopped
 #   environment:
 #     - TZ=Asia/Shanghai
-#     - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-root_password}
-#     - MYSQL_USER=${MYSQL_USER:-tgbot_user}
-#     - MYSQL_PASSWORD=${MYSQL_PASSWORD}
-#     - MYSQL_DATABASE=${MYSQL_DATABASE:-tgbot_verify}
+#   env_file:
+#     - ${DATA_DIR:-/docker/sheerid}/data/.env
 #   command:
 #     - --character-set-server=utf8mb4
 #     - --collation-server=utf8mb4_unicode_ci

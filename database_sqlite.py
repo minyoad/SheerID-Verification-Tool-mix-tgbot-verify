@@ -10,9 +10,9 @@ import sqlite3
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 
-from dotenv import load_dotenv
+from config import load_env_file
 
-load_dotenv()
+load_env_file()
 
 logger = logging.getLogger(__name__)
 

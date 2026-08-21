@@ -10,9 +10,9 @@
 """
 import os
 
-from dotenv import load_dotenv
+from config import load_env_file
 
-load_dotenv()
+load_env_file()
 
 DB_TYPE = os.getenv('DB_TYPE', 'sqlite').strip().lower()
 

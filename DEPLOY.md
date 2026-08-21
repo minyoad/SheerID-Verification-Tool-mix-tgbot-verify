@@ -47,12 +47,14 @@
 git clone https://github.com/PastKing/tgbot-verify.git
 cd tgbot-verify
 
-# 2. 配置环境变量
-cp env.example .env
-nano .env  # 填写你的配置
+# 2. 创建数据目录并配置环境变量
+#    配置由代码直接读取（不经过 docker-compose 解析），放在数据目录 .env：
+mkdir -p /docker/sheerid/data
+cp env.example /docker/sheerid/data/.env
+nano /docker/sheerid/data/.env  # 填写 BOT_TOKEN 等配置
 
 # 3. 启动服务
-docker-compose up -d
+docker-compose up -d --build
 
 # 4. 查看日志
 docker-compose logs -f
@@ -71,7 +73,13 @@ docker-compose down
 
 #### 1. 准备配置文件
 
-创建 `.env` 文件：
+创建数据目录并编辑配置文件（挂载进容器 `/app/data/.env`，由代码直接读取，
+不经过 docker-compose 变量解析，`2CAPTCHA_API_KEY` 等数字开头的变量名也可直接写入）：
+
+```bash
+mkdir -p /docker/sheerid/data
+nano /docker/sheerid/data/.env
+```
 
 ```env
 # Telegram Bot 配置

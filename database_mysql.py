@@ -7,10 +7,10 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 import pymysql
 from pymysql.cursors import DictCursor
-from dotenv import load_dotenv
+from config import load_env_file
 
 # 加载环境变量
-load_dotenv()
+load_env_file()
 
 logger = logging.getLogger(__name__)
 

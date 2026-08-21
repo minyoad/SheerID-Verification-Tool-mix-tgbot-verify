@@ -27,10 +27,16 @@ import re
 import time
 from typing import Tuple
 
-from dotenv import load_dotenv
+try:
+    from config import load_env_file
 
-# 确保 .env 被加载（即使从子模块/独立脚本入口运行，也能读到打码服务 key）
-load_dotenv()
+    # 确保 .env 被加载（Docker 下读 /app/data/.env，本地读项目根目录 .env）
+    load_env_file()
+except ImportError:
+    # 独立脚本入口（项目根目录不在 sys.path）：回退到默认根目录 .env
+    from dotenv import load_dotenv
+
+    load_dotenv()
 
 logger = logging.getLogger(__name__)
 
