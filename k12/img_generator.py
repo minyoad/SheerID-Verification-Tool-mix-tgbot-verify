@@ -605,7 +605,10 @@ def generate_teacher_png(first_name: str, last_name: str, doc_type: DocumentType
         
         # Use Playwright to screenshot
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+            )
             page = browser.new_page(viewport={'width': viewport[0], 'height': viewport[1]})
             
             page.set_content(html_content, wait_until='load')
