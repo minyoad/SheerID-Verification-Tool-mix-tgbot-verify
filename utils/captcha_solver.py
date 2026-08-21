@@ -104,6 +104,7 @@ _SITEKEY_ATTR_RE = re.compile(
 _SITEKEY_RENDER_RE = re.compile(
     r'turnstile[^"\']*render=(?:"|&quot;)?([A-Za-z0-9_-]{20,})'
 )
+_SITEKEY_IFRAME_RE = re.compile(r'[?&]sitekey=([A-Za-z0-9_-]{20,})')
 
 
 def get_turnstile_token(verification_url: str, timeout: int = _DEFAULT_TIMEOUT) -> str:
@@ -183,6 +184,21 @@ def _solve_with_playwright(verification_url: str, timeout: int) -> Tuple[str, st
             context.add_init_script(_STEALTH_JS)
             page = context.new_page()
 
+            # 监听网络请求：从 challenges.cloudflare.com 的 URL 参数提取 sitekey
+            # （turnstile API 脚本 render=xxx / iframe sitekey=xxx 必然带 sitekey，
+            #  是 SPA 页面最可靠的提取途径，比 DOM 查询兜底更强）
+            sitekey_from_requests = []
+
+            def _on_request(req):
+                url = req.url
+                if "challenges.cloudflare.com" not in url:
+                    return
+                m = re.search(r"[?&](?:sitekey|render)=([A-Za-z0-9_-]{20,})", url)
+                if m and m.group(1) not in sitekey_from_requests:
+                    sitekey_from_requests.append(m.group(1))
+
+            page.on("request", _on_request)
+
             logger.info(f"打开验证页面: {verification_url}")
             page.goto(verification_url, wait_until="domcontentloaded", timeout=30000)
 
@@ -191,6 +207,9 @@ def _solve_with_playwright(verification_url: str, timeout: int) -> Tuple[str, st
 
             # 提取 sitekey（供第三方兜底使用），并用完整 HTML 兜底
             sitekey = _extract_sitekey(page)
+            if not sitekey and sitekey_from_requests:
+                sitekey = sitekey_from_requests[0]
+                logger.info(f"已从网络请求 URL 提取到 sitekey: {sitekey[:8]}...")
             try:
                 html = page.content()
                 if not sitekey:
@@ -310,23 +329,52 @@ def _poll_token(page) -> str:
 
 
 def _extract_sitekey(page) -> str:
-    """从 DOM 中提取 Turnstile sitekey（供第三方兜底使用）"""
+    """从 DOM（含 shadow DOM 穿透）、turnstile 内部对象、脚本/iframe URL 提取 sitekey"""
     try:
         return (
             page.evaluate(
                 """() => {
-                    const el = document.querySelector(
-                        '[data-sitekey], [data-turnstile-sitekey]'
-                    );
-                    if (el) {
-                        return el.getAttribute('data-sitekey') ||
-                               el.getAttribute('data-turnstile-sitekey');
-                    }
-                    const scripts = Array.from(
-                        document.querySelectorAll('script[src*="turnstile"]')
-                    );
+                    const pick = (sk) => (sk && sk.length >= 20) ? sk : '';
+                    // 1. 常规 DOM + 递归穿透 shadow DOM
+                    const walk = (root) => {
+                        const els = root.querySelectorAll('*');
+                        for (const e of els) {
+                            const sk = e.getAttribute && pick(
+                                e.getAttribute('data-sitekey') || e.getAttribute('data-turnstile-sitekey')
+                            );
+                            if (sk) return sk;
+                            if (e.shadowRoot) {
+                                const r = walk(e.shadowRoot);
+                                if (r) return r;
+                            }
+                        }
+                        return '';
+                    };
+                    const r1 = walk(document);
+                    if (r1) return r1;
+                    // 2. turnstile 内部 widget 配置
+                    try {
+                        if (window.turnstile) {
+                            const widgets = window.turnstile._c || [];
+                            for (const item of widgets) {
+                                if (!item) continue;
+                                const sk = pick(
+                                    (item.config && item.config.sitekey) || item.sitekey
+                                );
+                                if (sk) return sk;
+                            }
+                        }
+                    } catch (e) {}
+                    // 3. 脚本 src render 参数
+                    const scripts = document.querySelectorAll('script[src*="turnstile"]');
                     for (const s of scripts) {
                         const m = s.src.match(/render=([A-Za-z0-9_-]{20,})/);
+                        if (m) return m[1];
+                    }
+                    // 4. iframe src sitekey 参数
+                    const frames = document.querySelectorAll('iframe');
+                    for (const f of frames) {
+                        const m = (f.src || '').match(/[?&]sitekey=([A-Za-z0-9_-]{20,})/);
                         if (m) return m[1];
                     }
                     return '';
@@ -374,6 +422,9 @@ def _extract_sitekey_from_html(html: str) -> str:
     if m:
         return m.group(1)
     m = _SITEKEY_RENDER_RE.search(html)
+    if m:
+        return m.group(1)
+    m = _SITEKEY_IFRAME_RE.search(html)
     if m:
         return m.group(1)
     return ""
