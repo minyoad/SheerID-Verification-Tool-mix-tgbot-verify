@@ -7,7 +7,7 @@ from telegram.ext import Application, CommandHandler
 from telegram.request import HTTPXRequest
 
 from config import BOT_TOKEN
-from database_mysql import Database
+from database import Database
 from handlers.user_commands import (
     start_command,
     about_command,
