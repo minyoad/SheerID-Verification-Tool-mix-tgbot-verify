@@ -25,6 +25,12 @@ import logging
 import os
 import re
 import time
+from typing import Tuple
+
+from dotenv import load_dotenv
+
+# 确保 .env 被加载（即使从子模块/独立脚本入口运行，也能读到打码服务 key）
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -105,16 +111,21 @@ def get_turnstile_token(verification_url: str, timeout: int = _DEFAULT_TIMEOUT) 
         str: Turnstile token，全部失败返回空字符串
     """
     sitekey = _fetch_sitekey_via_requests(verification_url)
+    action, cdata = _extract_turnstile_meta_from_html(_last_fetched_html)
 
-    token, dom_sitekey = _solve_with_playwright(verification_url, timeout)
+    token, dom_sitekey, dom_action, dom_cdata = _solve_with_playwright(
+        verification_url, timeout
+    )
     if token:
         logger.info("✓ Turnstile token 获取成功（Playwright 自动完成）")
         return token
 
     if dom_sitekey and not sitekey:
         sitekey = dom_sitekey
+    action = action or dom_action
+    cdata = cdata or dom_cdata
 
-    token = _solve_with_third_party(verification_url, sitekey)
+    token = _solve_with_third_party(verification_url, sitekey, action, cdata)
     if token:
         logger.info("✓ Turnstile token 获取成功（第三方打码服务）")
     return token
@@ -123,10 +134,12 @@ def get_turnstile_token(verification_url: str, timeout: int = _DEFAULT_TIMEOUT) 
 # ---------------------------------------------------------------------------
 # 策略 1：Playwright 反检测浏览器
 # ---------------------------------------------------------------------------
-def _solve_with_playwright(verification_url: str, timeout: int):
-    """通过 Playwright 打开验证页面自动完成验证；返回 (token, sitekey)"""
+def _solve_with_playwright(verification_url: str, timeout: int) -> Tuple[str, str, str, str]:
+    """通过 Playwright 打开验证页面自动完成验证；返回 (token, sitekey, action, cdata)"""
     token = ""
     sitekey = ""
+    action = ""
+    cdata = ""
     browser = None
     headless = os.getenv("CAPTCHA_HEADLESS", "true").strip().lower() != "false"
     force_headed = os.getenv("CAPTCHA_FORCE_HEADED", "").strip().lower() == "true"
@@ -170,8 +183,22 @@ def _solve_with_playwright(verification_url: str, timeout: int):
             # 等待 turnstile 脚本加载完成
             _wait_turnstile_loaded(page)
 
-            # 提取 sitekey（供第三方兜底使用）
+            # 提取 sitekey（供第三方兜底使用），并用完整 HTML 兜底
             sitekey = _extract_sitekey(page)
+            try:
+                html = page.content()
+                if not sitekey:
+                    sitekey = _extract_sitekey_from_html(html)
+                if not sitekey:
+                    # SPA 渲染后 sitekey 可能在 widget 配置 JSON 中
+                    m = re.search(r'["\']sitekey["\']\s*:\s*["\']([A-Za-z0-9_-]{20,})["\']', html)
+                    if m:
+                        sitekey = m.group(1)
+                action, cdata = _extract_turnstile_meta_from_html(html)
+            except Exception:
+                pass
+            if sitekey:
+                logger.info(f"已提取 Turnstile sitekey: {sitekey[:8]}...（action={action or '-'}）")
 
             # 主动触发 turnstile 执行（自动执行模式未生效时）
             _trigger_turnstile(page)
@@ -199,7 +226,7 @@ def _solve_with_playwright(verification_url: str, timeout: int):
             except Exception:
                 pass
 
-    return token, sitekey
+    return token, sitekey, action, cdata
 
 
 def _wait_turnstile_loaded(page, wait_secs: int = 10) -> bool:
@@ -282,8 +309,13 @@ def _extract_sitekey(page) -> str:
         return (
             page.evaluate(
                 """() => {
-                    const el = document.querySelector('[data-sitekey]');
-                    if (el) return el.getAttribute('data-sitekey');
+                    const el = document.querySelector(
+                        '[data-sitekey], [data-turnstile-sitekey]'
+                    );
+                    if (el) {
+                        return el.getAttribute('data-sitekey') ||
+                               el.getAttribute('data-turnstile-sitekey');
+                    }
                     const scripts = Array.from(
                         document.querySelectorAll('script[src*="turnstile"]')
                     );
@@ -303,8 +335,13 @@ def _extract_sitekey(page) -> str:
 # ---------------------------------------------------------------------------
 # sitekey 提取（requests 直连，供第三方兜底）
 # ---------------------------------------------------------------------------
+# 最近一次 requests 抓取的页面 HTML，供后续提取 data-action / data-cdata
+_last_fetched_html = ""
+
+
 def _fetch_sitekey_via_requests(page_url: str) -> str:
     """直接用 requests 抓取页面 HTML，正则提取 Turnstile sitekey"""
+    global _last_fetched_html
     try:
         import requests
 
@@ -316,9 +353,11 @@ def _fetch_sitekey_via_requests(page_url: str) -> str:
                 "Accept-Language": "en-US,en;q=0.9",
             },
         )
+        _last_fetched_html = r.text
         return _extract_sitekey_from_html(r.text)
     except Exception as e:
         logger.debug(f"requests 提取 sitekey 失败: {e}")
+        _last_fetched_html = ""
         return ""
 
 
@@ -334,10 +373,27 @@ def _extract_sitekey_from_html(html: str) -> str:
     return ""
 
 
+def _extract_turnstile_meta_from_html(html: str) -> Tuple[str, str]:
+    """从页面 HTML 提取 data-action 与 data-cdata（2captcha Turnstile 可选参数）"""
+    if not html:
+        return "", ""
+    action = ""
+    cdata = ""
+    m = re.search(r'data-action="([^"]+)"', html)
+    if m:
+        action = m.group(1)
+    m = re.search(r'data-cdata="([^"]+)"', html)
+    if m:
+        cdata = m.group(1)
+    return action, cdata
+
+
 # ---------------------------------------------------------------------------
 # 策略 2：第三方打码服务兜底
 # ---------------------------------------------------------------------------
-def _solve_with_third_party(page_url: str, sitekey: str) -> str:
+def _solve_with_third_party(
+    page_url: str, sitekey: str, action: str = "", cdata: str = ""
+) -> str:
     """调用第三方打码服务获取 token；未配置 key 或缺少 sitekey 时返回空串"""
     if not sitekey:
         logger.warning("无法提取 Turnstile sitekey，第三方打码服务不可用")
@@ -349,10 +405,15 @@ def _solve_with_third_party(page_url: str, sitekey: str) -> str:
     if capsolver_key:
         return _solve_with_capsolver(page_url, sitekey, capsolver_key)
     if twocaptcha_key:
-        return _solve_with_2captcha(page_url, sitekey, twocaptcha_key)
+        return _solve_with_2captcha(page_url, sitekey, twocaptcha_key, action, cdata)
 
     logger.warning(
-        "未配置第三方打码服务（CAPSOLVER_API_KEY / 2CAPTCHA_API_KEY），无法兜底"
+        "未检测到第三方打码服务 key（2CAPTCHA_API_KEY / CAPSOLVER_API_KEY 均为空）。"
+        "请确认：① 已创建项目根目录 .env 并填入 key；"
+        "② Docker 部署时 docker-compose 已转发该变量到容器"
+        "（注意 2CAPTCHA_API_KEY 以数字开头，Compose 的 .env 解析不支持，"
+        "需用 export 或 systemd Environment= 传入）；"
+        "③ 重启 bot 进程使配置生效"
     )
     return ""
 
@@ -405,8 +466,10 @@ def _solve_with_capsolver(page_url: str, sitekey: str, api_key: str) -> str:
     return ""
 
 
-def _solve_with_2captcha(page_url: str, sitekey: str, api_key: str) -> str:
-    """2captcha: method=turnstile"""
+def _solve_with_2captcha(
+    page_url: str, sitekey: str, api_key: str, action: str = "", cdata: str = ""
+) -> str:
+    """2captcha: method=turnstile（页面 widget 带 data-action/data-cdata 时需一并传入）"""
     try:
         import requests
     except Exception as e:
@@ -414,15 +477,20 @@ def _solve_with_2captcha(page_url: str, sitekey: str, api_key: str) -> str:
         return ""
 
     try:
+        params = {
+            "key": api_key,
+            "method": "turnstile",
+            "sitekey": sitekey,
+            "pageurl": page_url,
+            "json": 1,
+        }
+        if action:
+            params["action"] = action
+        if cdata:
+            params["data"] = cdata
         r = requests.get(
             "https://2captcha.com/in.php",
-            params={
-                "key": api_key,
-                "method": "turnstile",
-                "sitekey": sitekey,
-                "pageurl": page_url,
-                "json": 1,
-            },
+            params=params,
             timeout=20,
         )
         data = r.json()

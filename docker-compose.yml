@@ -16,6 +16,13 @@ services:
       # 数据库配置（默认 SQLite，无需额外服务）
       - DB_TYPE=${DB_TYPE:-sqlite}
       - SQLITE_PATH=${SQLITE_PATH:-/app/data/bot.db}
+      # Turnstile 验证码配置（Playwright 参数 + 第三方打码服务兜底）
+      # 注意：2CAPTCHA_API_KEY 以数字开头，Compose 的 .env 解析不支持，需通过
+      # shell export 或 systemd Environment= 传入；CAPSOLVER_API_KEY 无此限制。
+      - CAPTCHA_HEADLESS=${CAPTCHA_HEADLESS:-true}
+      - CAPTCHA_FORCE_HEADED=${CAPTCHA_FORCE_HEADED:-false}
+      - 2CAPTCHA_API_KEY=${2CAPTCHA_API_KEY:-}
+      - CAPSOLVER_API_KEY=${CAPSOLVER_API_KEY:-}
       # 如需 MySQL，将 DB_TYPE 设为 mysql 并取消下方注释（同时启用底部 mysql 服务）
       # - MYSQL_HOST=${MYSQL_HOST:-mysql}
       # - MYSQL_PORT=${MYSQL_PORT:-3306}
